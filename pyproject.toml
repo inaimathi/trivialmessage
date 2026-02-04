@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trivialmessage"
+version = "0.0.1"
+authors = [
+  { name = "inaimathi", email = "leo.zovic@gmail.com" },
+]
+description = "A trivial message platform abstraction layer (Fastmail/IMAP/SMTP; more platforms WIP)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+# Keep base lightweight: core models + interfaces should not force email deps.
+dependencies = [
+  "typing-extensions>=4.0.0",
+]
+
+[project.optional-dependencies]
+# Email platforms (IMAP/SMTP clients + Fastmail via HTTP)
+email = [
+  "httpx>=0.24.0",
+  "imapclient>=2.3.0",
+]
+
+# Protonmail Bridge adapter (only if you actually ship it in this library)
+# (Includes pexpect because bridge bootstrap/interaction often needs it.)
+protonmail = [
+  "imapclient>=2.3.0",
+  "pexpect>=4.8.0",
+]
+
+# Future/WIP platforms — intentionally omitted for now:
+# gmail = [...]
+# outlook = [...]
+# slack = [...]
+# whatsapp = [...]
+
+[project.urls]
+Homepage = "https://github.com/inaimathi/trivialmessage"
+Issues = "https://github.com/inaimathi/trivialmessage/issues"
