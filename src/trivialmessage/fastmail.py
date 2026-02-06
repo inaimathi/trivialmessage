@@ -5,7 +5,8 @@ from typing import AsyncIterator, Dict, List, Optional
 
 import httpx
 
-from .common import Message, MessageFilter, MessagePlatform
+from .common import (Message, MessageFilter, MessagePlatform,
+                     canonicalize_from_recipient)
 
 JMAP_CORE = "urn:ietf:params:jmap:core"
 JMAP_MAIL = "urn:ietf:params:jmap:mail"
@@ -813,6 +814,10 @@ class FastmailPlatform(MessagePlatform):
             quoted_text += "\n".join(f"> {line}" for line in original_text.split("\n"))
             reply_content += quoted_text
 
+        from_email = kwargs.get("from_email") or canonicalize_from_recipient(
+            original_message.recipient
+        )
+
         return self.send(
             content=reply_content,
             to=reply_to,
@@ -820,7 +825,7 @@ class FastmailPlatform(MessagePlatform):
             html=kwargs.get("html"),
             cc=kwargs.get("cc"),
             bcc=kwargs.get("bcc"),
-            from_email=kwargs.get("from_email"),
+            from_email=from_email,
         )
 
     async def reply_async(
@@ -849,6 +854,10 @@ class FastmailPlatform(MessagePlatform):
             quoted_text += "\n".join(f"> {line}" for line in original_text.split("\n"))
             reply_content += quoted_text
 
+        from_email = kwargs.get("from_email") or canonicalize_from_recipient(
+            original_message.recipient
+        )
+
         return await self.send_async(
             content=reply_content,
             to=reply_to,
@@ -856,5 +865,5 @@ class FastmailPlatform(MessagePlatform):
             html=kwargs.get("html"),
             cc=kwargs.get("cc"),
             bcc=kwargs.get("bcc"),
-            from_email=kwargs.get("from_email"),
+            from_email=from_email,
         )

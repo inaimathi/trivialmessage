@@ -1,9 +1,33 @@
 # src/trivialmessage/common.py
 import json
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from email.utils import parseaddr
 from typing import Any, AsyncIterator, Dict, List, Optional
+
+
+def canonicalize_from_recipient(recipient: str | None) -> str | None:
+    """
+    Turn 'foo+username@bar.ext' into 'foo@bar.ext'.
+
+    Accepts either raw emails or 'Name <addr@domain>'.
+    Returns None if missing/unparseable.
+    """
+    if not recipient:
+        return None
+
+    _, addr = parseaddr(recipient)
+    addr = (addr or recipient).strip()
+    if "@" not in addr:
+        return None
+
+    local, domain = addr.split("@", 1)
+    if "+" in local:
+        local = local.split("+", 1)[0]
+
+    return f"{local}@{domain}"
 
 
 def _to_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -208,3 +232,26 @@ class MessagePlatform(ABC):
     def reply(self, original_message: Message, content: str, **kwargs) -> Message:
         """Reply to an original message via the same channel/method it came from."""
         raise NotImplementedError
+
+
+class FixedSizeSet:
+    def __init__(self, max_size):
+        self.max_size = max_size
+        self.set_data = set()
+        self.deque_data = deque(maxlen=max_size)
+
+    def add(self, item):
+        if item not in self.set_data:
+            if len(self.set_data) >= self.max_size:
+                # Remove the oldest item from the deque and the set
+                oldest_item = self.deque_data.popleft()
+                self.set_data.remove(oldest_item)
+            # Add the new item to both the deque and the set
+            self.set_data.add(item)
+            self.deque_data.append(item)
+
+    def __contains__(self, item):
+        return item in self.set_data
+
+    def __len__(self):
+        return len(self.set_data)
