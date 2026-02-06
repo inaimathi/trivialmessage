@@ -40,6 +40,7 @@ class FastmailPlatform(MessagePlatform):
         self._mailbox_role_cache: Dict[str, str] = {}
         self._identity_cache_by_email: Dict[str, str] = {}
         self._default_identity_id: str | None = None
+        self._mailbox_id_info_cache: Dict[str, Dict[str, str]] = {}
 
         # Always load the JMAP session to discover apiUrl + primary accounts.
         self._load_session()
@@ -166,6 +167,74 @@ class FastmailPlatform(MessagePlatform):
     # -------------------------------------------------------------------------
     # Filters / parsing
     # -------------------------------------------------------------------------
+    def _mailbox_info_for_ids(self, ids: List[str]) -> None:
+        """Populate _mailbox_id_info_cache for the given mailbox ids."""
+        missing = [i for i in ids if i and i not in self._mailbox_id_info_cache]
+        if not missing:
+            return
+
+        call = [
+            "Mailbox/get",
+            {
+                "accountId": self.account_id,
+                "ids": missing,
+                "properties": ["id", "role", "name"],
+            },
+            "mbg0",
+        ]
+        res = self._make_jmap_request([call], using=[JMAP_CORE, JMAP_MAIL])
+        mrs = res.get("methodResponses") or []
+        if not mrs or mrs[0][0] != "Mailbox/get":
+            return
+
+        boxes = (mrs[0][1] or {}).get("list") or []
+        for b in boxes:
+            mid = (b or {}).get("id") or ""
+            if not mid:
+                continue
+            role = (b or {}).get("role") or ""
+            name = (b or {}).get("name") or ""
+            self._mailbox_id_info_cache[mid] = {"role": role, "name": name}
+
+    def _folders_for_email(self, email_data: dict) -> tuple[Optional[str], List[str]]:
+        """
+        Return (primary_folder, folders[]) for a JMAP Email object.
+        folders are role-first (e.g. 'inbox','sent','drafts'), else mailbox names.
+        """
+        mids = email_data.get("mailboxIds") or {}
+        if not isinstance(mids, dict) or not mids:
+            return None, []
+
+        mailbox_ids = [k for k, v in mids.items() if v and isinstance(k, str)]
+        if not mailbox_ids:
+            return None, []
+
+        self._mailbox_info_for_ids(mailbox_ids)
+
+        roles: List[str] = []
+        names: List[str] = []
+        for mid in mailbox_ids:
+            info = self._mailbox_id_info_cache.get(mid) or {}
+            r = (info.get("role") or "").strip()
+            n = (info.get("name") or "").strip()
+            if r:
+                roles.append(r)
+            elif n:
+                names.append(n)
+
+        folders = roles + names
+
+        # Choose a primary folder with sensible precedence
+        pref = ["inbox", "drafts", "sent", "trash", "spam", "archive"]
+        primary = None
+        for p in pref:
+            if p in roles:
+                primary = p
+                break
+        if primary is None:
+            primary = folders[0] if folders else None
+
+        return primary, folders
 
     def _build_email_filter(self, filters: Optional[MessageFilter]) -> dict:
         """Convert MessageFilter to JMAP Email/query filter."""
@@ -189,6 +258,14 @@ class FastmailPlatform(MessagePlatform):
             cond["before"] = filters.until.astimezone(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
+        if filters.folder:
+            # We treat folder as a mailbox *role* ('inbox', 'sent', 'drafts', ...)
+            try:
+                mid = self._mailbox_id_for_role(filters.folder, required=False)
+            except Exception:
+                mid = None
+            if mid:
+                cond["inMailbox"] = mid
 
         return cond
 
@@ -253,6 +330,7 @@ class FastmailPlatform(MessagePlatform):
         html_out = (
             html_content if html_content and html_content != text_content else None
         )
+        primary_folder, folders = self._folders_for_email(email_data)
 
         return Message(
             id=email_data.get("id", ""),
@@ -265,6 +343,8 @@ class FastmailPlatform(MessagePlatform):
             thread_id=email_data.get("threadId"),
             in_reply_to=email_data.get("inReplyTo"),
             html_content=html_out,
+            folder=primary_folder,  # NEW
+            folders=folders or None,  # NEW
             raw_data=email_data,
             platform_metadata={
                 "message_id": email_data.get("messageId"),

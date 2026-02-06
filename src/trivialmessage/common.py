@@ -53,6 +53,10 @@ def _norm_str(s: Any) -> str:
     return str(s or "").casefold()
 
 
+def _norm_list(xs: Optional[List[Any]]) -> List[str]:
+    return [_norm_str(x) for x in (xs or []) if str(x or "").strip()]
+
+
 @dataclass
 class MessageFilter:
     """Filters for message retrieval"""
@@ -65,8 +69,12 @@ class MessageFilter:
     until: Optional[datetime] = None
     thread_id: Optional[str] = None  # for threaded platforms
 
+    folder: Optional[str] = None  # include: message must be in this folder
+    exclude_folders: Optional[List[str]] = (
+        None  # exclude: message must NOT be in any of these
+    )
+
     def __post_init__(self) -> None:
-        # Normalize any provided datetimes to aware UTC to avoid naive/aware TypeErrors.
         self.since = _to_aware_utc(self.since)
         self.until = _to_aware_utc(self.until)
 
@@ -95,6 +103,11 @@ class Message:
     html_content: Optional[str] = None
     attachments: Optional[List[Dict]] = None
 
+    # - folder: a single "primary" folder (best-effort)
+    # - folders: all known folders/roles/names this message belongs to
+    folder: Optional[str] = None
+    folders: Optional[List[str]] = None
+
     # Platform metadata (optional)
     raw_data: Optional[Dict] = None  # original platform response
     platform_metadata: Optional[Dict] = None  # platform-specific fields
@@ -115,32 +128,26 @@ class Message:
         return json.dumps(self.to_dict(), default=str, indent=2)
 
     def matches_filter(self, filters: Optional[MessageFilter]) -> bool:
-        """Check if this message matches the given filters (case-insensitive where applicable)."""
         if not filters:
             return True
 
-        # Sender filtering (case-insensitive substring)
         if filters.sender:
             if _norm_str(filters.sender) not in _norm_str(self.sender):
                 return False
 
-        # Recipient filtering (case-insensitive substring)
         if filters.recipient:
             if _norm_str(filters.recipient) not in _norm_str(self.recipient):
                 return False
 
-        # Subject filtering (case-insensitive substring)
         if filters.subject_contains:
             if _norm_str(filters.subject_contains) not in _norm_str(self.subject):
                 return False
 
-        # Content filtering (case-insensitive substring)
         if filters.content_contains:
             combined = " ".join([self.content or "", self.html_content or ""])
             if _norm_str(filters.content_contains) not in _norm_str(combined):
                 return False
 
-        # Thread filtering (exact match as string)
         if filters.thread_id is not None:
             if str(self.thread_id) != str(filters.thread_id):
                 return False
@@ -149,12 +156,24 @@ class Message:
         msg_ts = _to_aware_utc(self.timestamp)
         since = _to_aware_utc(filters.since)
         until = _to_aware_utc(filters.until)
-
         if msg_ts:
             if since and msg_ts < since:
                 return False
             if until and msg_ts > until:
                 return False
+
+        # NEW: folder filtering
+        msg_folders = _norm_list(self.folders) + (
+            [_norm_str(self.folder)] if self.folder else []
+        )
+        want = _norm_str(filters.folder) if filters.folder else ""
+        if want:
+            if want not in msg_folders:
+                return False
+
+        banned = set(_norm_list(filters.exclude_folders))
+        if banned and any(f in banned for f in msg_folders):
+            return False
 
         return True
 
