@@ -1,7 +1,7 @@
 # src/trivialmessage/fastmail.py
 import asyncio
 from datetime import datetime, timezone
-from typing import AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 import httpx
 
@@ -167,6 +167,7 @@ class FastmailPlatform(MessagePlatform):
     # -------------------------------------------------------------------------
     # Filters / parsing
     # -------------------------------------------------------------------------
+
     def _mailbox_info_for_ids(self, ids: List[str]) -> None:
         """Populate _mailbox_id_info_cache for the given mailbox ids."""
         missing = [i for i in ids if i and i not in self._mailbox_id_info_cache]
@@ -311,6 +312,63 @@ class FastmailPlatform(MessagePlatform):
 
         return text, html
 
+    @staticmethod
+    def _as_message_id_list(v: Any) -> List[str]:
+        """
+        Normalize a JMAP MessageId-ish value into a list[str].
+
+        JMAP Email.messageId/inReplyTo/references are String[]|null (often 1 item).
+        """
+        if not v:
+            return []
+        if isinstance(v, str):
+            s = v.strip()
+            return [s] if s else []
+        if isinstance(v, (list, tuple)):
+            out: List[str] = []
+            for x in v:
+                if isinstance(x, str):
+                    s = x.strip()
+                    if s:
+                        out.append(s)
+            return out
+        return []
+
+    def _threading_headers_for_reply(
+        self, original_message: Message
+    ) -> tuple[List[str], List[str]]:
+        """
+        Compute (inReplyTo, references) for a reply.
+
+        - inReplyTo: the original messageId (String[])
+        - references: original references chain + original messageId, deduped
+        """
+        meta = getattr(original_message, "platform_metadata", None) or {}
+
+        orig_mid = self._as_message_id_list(meta.get("message_id"))
+        if not orig_mid:
+            # Fallback: if this Message came from Fastmail but metadata was altered,
+            # try the raw_data JMAP Email object.
+            raw = getattr(original_message, "raw_data", None) or {}
+            if isinstance(raw, dict):
+                orig_mid = self._as_message_id_list(raw.get("messageId"))
+
+        orig_refs = self._as_message_id_list(meta.get("references"))
+        if not orig_refs:
+            raw = getattr(original_message, "raw_data", None) or {}
+            if isinstance(raw, dict):
+                orig_refs = self._as_message_id_list(raw.get("references"))
+
+        # Build references = refs + mid, preserving order and removing duplicates.
+        refs: List[str] = []
+        seen: set[str] = set()
+        for x in orig_refs + orig_mid:
+            if x not in seen:
+                seen.add(x)
+                refs.append(x)
+
+        return orig_mid, refs
+
     def _convert_fastmail_email(self, email_data: dict) -> Message:
         """Convert JMAP Email object to Message."""
         timestamp = self._parse_received_at(email_data.get("receivedAt"))
@@ -348,6 +406,7 @@ class FastmailPlatform(MessagePlatform):
             raw_data=email_data,
             platform_metadata={
                 "message_id": email_data.get("messageId"),
+                "references": email_data.get("references"),
                 "mailbox_ids": email_data.get("mailboxIds", {}),
                 "keywords": email_data.get("keywords", {}),
                 "size": email_data.get("size"),
@@ -476,6 +535,7 @@ class FastmailPlatform(MessagePlatform):
                     "size",
                     "preview",
                     "inReplyTo",
+                    "references",
                     "textBody",
                     "htmlBody",
                     "bodyValues",
@@ -594,6 +654,7 @@ class FastmailPlatform(MessagePlatform):
                             "mailboxIds",
                             "preview",
                             "inReplyTo",
+                            "references",
                             "textBody",
                             "htmlBody",
                             "bodyValues",
@@ -665,6 +726,10 @@ class FastmailPlatform(MessagePlatform):
         bcc = kwargs.get("bcc")
         from_email = kwargs.get("from_email")
 
+        # Optional threading headers (JMAP Email.inReplyTo / Email.references)
+        in_reply_to = self._as_message_id_list(kwargs.get("in_reply_to"))
+        references = self._as_message_id_list(kwargs.get("references"))
+
         drafts_mailbox_id = self._mailbox_id_for_role("drafts", required=True)
         sent_mailbox_id = self._mailbox_id_for_role("sent", required=False)
         identity_id = self._identity_id(from_email)
@@ -678,6 +743,12 @@ class FastmailPlatform(MessagePlatform):
             "textBody": [{"partId": "t1", "type": "text/plain"}],
             "bodyValues": {"t1": {"charset": "utf-8", "value": content}},
         }
+
+        # Threading: make this message a reply (client-visible threads)
+        if in_reply_to:
+            email_obj["inReplyTo"] = in_reply_to
+        if references:
+            email_obj["references"] = references
 
         if from_email:
             email_obj["from"] = [{"email": from_email}]
@@ -779,6 +850,9 @@ class FastmailPlatform(MessagePlatform):
         bcc = kwargs.get("bcc")
         from_email = kwargs.get("from_email")
 
+        in_reply_to = self._as_message_id_list(kwargs.get("in_reply_to"))
+        references = self._as_message_id_list(kwargs.get("references"))
+
         # mailbox/identity helpers are sync; do them in threads if needed
         drafts_mailbox_id = await asyncio.to_thread(
             self._mailbox_id_for_role, "drafts", True
@@ -796,6 +870,11 @@ class FastmailPlatform(MessagePlatform):
             "textBody": [{"partId": "t1", "type": "text/plain"}],
             "bodyValues": {"t1": {"charset": "utf-8", "value": content}},
         }
+
+        if in_reply_to:
+            email_obj["inReplyTo"] = in_reply_to
+        if references:
+            email_obj["references"] = references
 
         if from_email:
             email_obj["from"] = [{"email": from_email}]
@@ -898,6 +977,8 @@ class FastmailPlatform(MessagePlatform):
             original_message.recipient
         )
 
+        in_reply_to, references = self._threading_headers_for_reply(original_message)
+
         return self.send(
             content=reply_content,
             to=reply_to,
@@ -906,6 +987,8 @@ class FastmailPlatform(MessagePlatform):
             cc=kwargs.get("cc"),
             bcc=kwargs.get("bcc"),
             from_email=from_email,
+            in_reply_to=in_reply_to,
+            references=references,
         )
 
     async def reply_async(
@@ -938,6 +1021,8 @@ class FastmailPlatform(MessagePlatform):
             original_message.recipient
         )
 
+        in_reply_to, references = self._threading_headers_for_reply(original_message)
+
         return await self.send_async(
             content=reply_content,
             to=reply_to,
@@ -946,4 +1031,6 @@ class FastmailPlatform(MessagePlatform):
             cc=kwargs.get("cc"),
             bcc=kwargs.get("bcc"),
             from_email=from_email,
+            in_reply_to=in_reply_to,
+            references=references,
         )
