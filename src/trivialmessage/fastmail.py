@@ -855,10 +855,10 @@ class FastmailPlatform(MessagePlatform):
 
         # mailbox/identity helpers are sync; do them in threads if needed
         drafts_mailbox_id = await asyncio.to_thread(
-            self._mailbox_id_for_role, "drafts", True
+            lambda: self._mailbox_id_for_role("drafts", required=True)
         )
         sent_mailbox_id = await asyncio.to_thread(
-            self._mailbox_id_for_role, "sent", False
+            lambda: self._mailbox_id_for_role("sent", required=False)
         )
         identity_id = await asyncio.to_thread(self._identity_id, from_email)
 
