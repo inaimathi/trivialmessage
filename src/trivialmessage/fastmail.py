@@ -472,19 +472,47 @@ class FastmailPlatform(MessagePlatform):
         self._default_identity_id = (identities[0] or {}).get("id")
 
     def _identity_id(self, from_email: str | None) -> str:
-        """Return identity id; if from_email provided, match it."""
+        """
+        Return the identity used to submit a message.
+
+        Resolution order:
+          1. Exact identity match.
+          2. Catch-all identity for the requested domain.
+          3. Default identity when no From address was requested.
+
+        Fastmail performs the authoritative permission check when the message
+        is submitted. A matching catch-all identity may authorize arbitrary
+        addresses at its domain.
+        """
         if not self._default_identity_id or not self._identity_cache_by_email:
             self._load_identities()
 
         if from_email:
-            k = from_email.lower()
-            iid = self._identity_cache_by_email.get(k)
-            if not iid:
-                raise OSError(f"No identity matches from_email={from_email!r}")
-            return iid
+            requested = from_email.strip().lower()
+
+            # Explicit alias or identity.
+            iid = self._identity_cache_by_email.get(requested)
+            if iid:
+                return iid
+
+            # Catch-all identity for this domain.
+            try:
+                _, domain = requested.rsplit("@", 1)
+            except ValueError:
+                raise ValueError(f"Invalid from_email={from_email!r}") from None
+
+            iid = self._identity_cache_by_email.get(f"*@{domain}")
+            if iid:
+                return iid
+
+            raise OSError(
+                f"No identity or catch-all identity matches "
+                f"from_email={from_email!r}"
+            )
 
         if not self._default_identity_id:
             raise OSError("No default identity available")
+
         return self._default_identity_id
 
     # -------------------------------------------------------------------------
