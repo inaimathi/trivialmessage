@@ -91,7 +91,14 @@ class Message:
     timestamp: datetime
 
     # Communication-specific fields (optional)
-    recipient: Optional[str] = None  # email: to field, chat: channel
+    #
+    # `recipient` remains the backwards-compatible primary recipient:
+    # - email: first/primary To address
+    # - chat: channel
+    #
+    # Email adapters that know about multiple recipients may additionally
+    # populate `recipients` below.
+    recipient: Optional[str] = None
     subject: Optional[str] = None  # email only
 
     # Threading/conversation fields (optional)
@@ -112,15 +119,66 @@ class Message:
     raw_data: Optional[Dict] = None  # original platform response
     platform_metadata: Optional[Dict] = None  # platform-specific fields
 
+    # All known recipients, when exposed by the platform.
+    #
+    # This is deliberately the final dataclass field so adding it does not
+    # change the positional meaning of any existing Message(...) constructor
+    # calls.
+    #
+    # Older adapters may leave this as None and populate only `recipient`.
+    # Newer email adapters may populate it with all To/Cc/Bcc recipients.
+    recipients: Optional[List[str]] = None
+
     def __post_init__(self) -> None:
         # Always store timestamps as aware UTC.
         self.timestamp = _to_aware_utc(self.timestamp) or datetime.now(timezone.utc)
 
+    def all_recipients(self) -> List[str]:
+        """
+        Return every known recipient.
+
+        The legacy singular `recipient` is always considered first, followed
+        by entries from the newer plural `recipients` field.
+
+        Values are de-duplicated case-insensitively while preserving their
+        original spelling and order.
+        """
+        out: List[str] = []
+        seen: set[str] = set()
+
+        values = [self.recipient, *(self.recipients or [])]
+
+        for value in values:
+            if value is None:
+                continue
+
+            text = str(value).strip()
+            if not text:
+                continue
+
+            key = text.casefold()
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            out.append(text)
+
+        return out
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary with proper datetime handling."""
         data = asdict(self)
+
         if self.timestamp:
             data["timestamp"] = _to_aware_utc(self.timestamp).isoformat()
+
+        # Preserve the historical serialized shape for messages produced by
+        # older/single-recipient adapters. The field appears only when an
+        # adapter actually supplies plural recipient information.
+        if self.recipients is None:
+            data.pop("recipients", None)
+
         return data
 
     def to_json(self) -> str:
@@ -136,7 +194,11 @@ class Message:
                 return False
 
         if filters.recipient:
-            if _norm_str(filters.recipient) not in _norm_str(self.recipient):
+            wanted = _norm_str(filters.recipient)
+
+            if not any(
+                wanted in _norm_str(recipient) for recipient in self.all_recipients()
+            ):
                 return False
 
         if filters.subject_contains:
@@ -156,22 +218,26 @@ class Message:
         msg_ts = _to_aware_utc(self.timestamp)
         since = _to_aware_utc(filters.since)
         until = _to_aware_utc(filters.until)
+
         if msg_ts:
             if since and msg_ts < since:
                 return False
             if until and msg_ts > until:
                 return False
 
-        # NEW: folder filtering
+        # Folder filtering
         msg_folders = _norm_list(self.folders) + (
             [_norm_str(self.folder)] if self.folder else []
         )
+
         want = _norm_str(filters.folder) if filters.folder else ""
+
         if want:
             if want not in msg_folders:
                 return False
 
         banned = set(_norm_list(filters.exclude_folders))
+
         if banned and any(f in banned for f in msg_folders):
             return False
 
@@ -179,32 +245,51 @@ class Message:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Message":
-        """Create Message from dictionary, handling datetime parsing + UTC normalization."""
+        """
+        Create Message from dictionary, handling datetime parsing + UTC
+        normalization.
+
+        This is automatically backwards/forwards compatible with `recipients`:
+        old dictionaries omit it, while new dictionaries pass it through as a
+        normal dataclass field.
+        """
         d = dict(data or {})
 
         ts = d.get("timestamp")
+
         if isinstance(ts, str):
             try:
                 parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
                 d["timestamp"] = _to_aware_utc(parsed)
             except ValueError:
                 d["timestamp"] = datetime.now(timezone.utc)
+
         elif isinstance(ts, datetime):
             d["timestamp"] = _to_aware_utc(ts)
+
         else:
             d["timestamp"] = datetime.now(timezone.utc)
 
         valid_fields = {field.name for field in cls.__dataclass_fields__.values()}
+
         filtered_data = {k: v for k, v in d.items() if k in valid_fields}
+
         return cls(**filtered_data)
 
     def __str__(self) -> str:
-        return f"Message({self.platform_type}:{self.id[:8]}... from {self.sender})"
+        return (
+            f"Message("
+            f"{self.platform_type}:{self.id[:8]}... "
+            f"from {self.sender}"
+            f")"
+        )
 
     def __repr__(self) -> str:
         return (
-            f"Message(id='{self.id}', platform='{self.platform_type}', "
-            f"sender='{self.sender}', timestamp={self.timestamp})"
+            f"Message(id='{self.id}', "
+            f"platform='{self.platform_type}', "
+            f"sender='{self.sender}', "
+            f"timestamp={self.timestamp})"
         )
 
 
