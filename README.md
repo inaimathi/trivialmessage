@@ -10,7 +10,44 @@ The goal is to make it easy to:
 - apply consistent filtering (sender/recipient/subject/time windows),
 - keep datetimes normalized to UTC.
 
-> Note: Several platforms (Gmail/Outlook/Slack/WhatsApp) are intentionally **WIP** and may be stubbed or absent.
+> Note: Several platforms (Gmail/Outlook) are intentionally **WIP** and may be stubbed or absent. Slack and WhatsApp were WIP but have since been fixed and covered by tests (see Changelog); Twilio (SMS + a deliberately partial Voice adapter) is new.
+
+---
+
+## Changelog
+
+### Unreleased
+
+- **Slack**: fixed `listen()`, which previously never yielded any messages.
+  It imported `AsyncSocketModeClient` from a module that only exposes the
+  abstract base class, and its event handler was written as an async
+  *generator* even though `slack_sdk` only ever `await`s listener
+  callbacks — so nothing it `yield`ed ever reached a caller, and events
+  were never acknowledged (causing Slack to redeliver them). Fixed by
+  bridging the callback to an internal `asyncio.Queue` and explicitly
+  acking each event. Added the missing `send_async`/`reply_async`. See
+  [Slack rationale](#slack) below.
+- **WhatsApp**: fixed `listen()`, which had no `yield` anywhere in its
+  body and was therefore a plain coroutine rather than an async
+  generator — `async for msg in wa.listen()` raised a confusing
+  `TypeError` before ever reaching the intended `NotImplementedError`.
+  Added `send_async`/`reply_async` and surfaced HTTP error responses
+  (4xx/5xx were previously parsed as if they'd succeeded). See
+  [WhatsApp rationale](#whatsapp) below.
+- **IMAP**: fixed a real data-integrity bug — message bodies were
+  fetched with `(RFC822)`, which implicitly sets `\Seen` on most real
+  IMAP servers, silently turning `get_unread()` into a mark-as-read
+  operation. Switched to `BODY.PEEK[]`, which this module's own
+  docstring already claimed (incorrectly) to be using.
+- **Twilio**: new `trivialmessage.twilio` module with two classes -
+  `TwilioSMSPlatform` (full `MessagePlatform` interface, including a
+  real `get_recent` since Twilio's Messages resource is genuinely
+  queryable) and `TwilioVoicePlatform` (deliberately partial - see
+  [Twilio Voice rationale](#twilio-sms--voice) below). New `AudioContent`
+  type for voice payloads.
+- Added a `tests/` directory (previously the repo had none) covering
+  Slack, WhatsApp, IMAP, SMTP, and Twilio with a mix of mocked and real
+  local-server integration tests - see `unittest.sh`.
 
 ---
 
@@ -151,6 +188,99 @@ asyncio.run(main())
 * Fastmail provides stable ids; `message_id` should be populated.
 * Datetimes are normalized to UTC.
 * If you apply sender/recipient filters, they should be case-insensitive (normalize first).
+
+---
+
+### Slack
+
+Slack is a first-class chat platform using the Slack Web API for
+send/reply/history and Socket Mode for real-time listening.
+
+#### Credentials
+
+* A bot token (`xoxb-...`) with `chat:write`, `channels:history`,
+  `groups:history`, `im:history`, and `mpim:history` scopes.
+* An app-level token (`xapp-...`) with the `connections:write` scope,
+  required only for `listen()` (Socket Mode).
+
+#### Usage
+
+```python
+import asyncio
+from trivialmessage.slack import SlackPlatform
+
+slack = SlackPlatform(bot_token="xoxb-...", app_token="xapp-...")
+
+sent = slack.send("deploy finished", channel="C0123456")
+
+async def main():
+    async for msg in slack.listen():
+        print(msg.sender, msg.content)
+
+asyncio.run(main())
+```
+
+#### Rationale
+
+`listen()` is implemented as a queue bridge rather than a direct
+generator: Slack's `slack_sdk` Socket Mode client delivers events by
+*calling a callback you register*, not by handing you an iterator, so
+the adapter registers a small `async def message_handler(client, req)`
+that acknowledges each event (`send_socket_mode_response`, required or
+Slack will redeliver the event) and pushes a converted `Message` onto an
+internal `asyncio.Queue`. `listen()` itself is just `while True: yield
+await queue.get()`. This is the same shape SMS/Signal-style
+webhook-driven platforms need (see the Twilio section), so it's worth
+recognizing as a reusable pattern rather than a Slack-specific one.
+
+`get_unread` has no true "unread" concept for a bot identity, so it
+approximates by returning recent (last 24h by default) messages across
+every channel the bot can see - this is expensive (one API call per
+channel) and intended for occasional polling, not tight loops; prefer
+`listen()` for anything latency-sensitive.
+
+---
+
+### WhatsApp
+
+WhatsApp Business Cloud API support, send/reply only by design - see
+below for why `get_unread`/`get_recent` are unsupported.
+
+#### Credentials
+
+* A phone number ID (used in the Graph API URL path, despite the
+  constructor argument being named `phone_number`)
+* A permanent or long-lived access token with `whatsapp_business_messaging`
+
+#### Usage
+
+```python
+from trivialmessage.whatsapp import WhatsAppPlatform
+
+wa = WhatsAppPlatform(phone_number="1234567890", access_token="...")
+sent = wa.send("your order shipped", to="15550001234")
+```
+
+#### Rationale
+
+`get_unread` and `get_recent` raise `NotImplementedError` deliberately,
+not as a placeholder: the WhatsApp Cloud API has no endpoint to list or
+query message history at all - it is a pure push (webhook) delivery
+model with no server-side inbox to poll. Faking history by buffering
+whatever `listen()` has seen would silently change the semantics (an
+app-level cache masquerading as a platform capability), so this module
+is honest about the gap instead.
+
+`listen()` likewise raises `NotImplementedError`: receiving messages
+requires a webhook endpoint that WhatsApp calls, which means running a
+public HTTP server - something this library deliberately doesn't own
+(see the Twilio SMS section for the pattern once that server exists in
+your application). Because `listen()` has no `yield` anywhere in a
+correct implementation of "not implemented yet", it still needs an
+unreachable `yield` after the `raise` so Python treats it as an async
+*generator* function - otherwise `async for msg in wa.listen()` fails
+with a confusing `TypeError` before ever reaching the intended error
+message.
 
 ---
 
@@ -305,6 +435,79 @@ asyncio.run(main())
 
 ---
 
+### Twilio (SMS + Voice)
+
+`trivialmessage.twilio` provides two separate classes on one shared
+Twilio account: `TwilioSMSPlatform` (full `MessagePlatform` interface)
+and `TwilioVoicePlatform` (send/reply only - a robocall notifier, not an
+inbound call service).
+
+#### Credentials
+
+* `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` (shared by both classes)
+* `TWILIO_FROM_NUMBER` or `TWILIO_MESSAGING_SERVICE_SID` for SMS
+* `TWILIO_VOICE_FROM_NUMBER` for Voice
+
+#### Usage
+
+```python
+import asyncio
+from trivialmessage.twilio import TwilioSMSPlatform, TwilioVoicePlatform, AudioContent
+
+sms = TwilioSMSPlatform.from_env()
+sms.send("build failed on main", to="+15551234567")
+
+# Inbound SMS arrives via a webhook you host - wire your framework's
+# route to feed parsed messages into listen()'s queue:
+#   sms.ingest(TwilioSMSPlatform.parse_webhook(request.form))
+async def main():
+    async for msg in sms.listen():
+        print(msg.sender, msg.content)
+asyncio.run(main())
+
+voice = TwilioVoicePlatform.from_env()
+voice.send(AudioContent(text="Production is down. Please acknowledge."), to="+15551234567")
+```
+
+#### Rationale
+
+**SMS is a full adapter** because Twilio's Messages resource is
+genuinely queryable (`GET /Messages.json` filtered by `To`/`From`/date),
+unlike WhatsApp's Cloud API - so `get_recent` is a real implementation,
+not a stub. `get_unread` still raises `NotImplementedError`: SMS itself
+has no server-side read/unread state to query, regardless of provider.
+`listen()` uses the same queue-bridge pattern as Slack, adapted for a
+webhook instead of a socket: Twilio calls a webhook URL you configure
+on your number for each inbound message, so the adapter exposes
+`parse_webhook()` (pure, easily testable) and `ingest()` (pushes onto
+the internal queue) for your web framework to call from its route
+handler, rather than the library trying to own an HTTP server itself.
+
+**Voice is intentionally partial.** The brief here was a way to notify
+people of urgent developments by phone call - not a full inbound call
+service, not a conversational agent. `TwilioVoicePlatform` therefore
+does *not* subclass `MessagePlatform` (whose ABC would force stub
+implementations of `listen`/`get_recent`/`get_unread` that would just be
+lies) and only implements `send`/`send_async`/`reply`/`reply_async`.
+Standing up webhook handling for inbound calls, call-status callbacks,
+or DTMF acknowledgment is a real feature some day, but it's a
+meaningfully bigger scope (a public server, a webhook contract, a
+retry/escalation policy) than "place a call that speaks a message" -
+better added deliberately later than half-implemented now.
+
+`content` for voice is an `AudioContent` (`text` spoken via Twilio's
+built-in `<Say>` TTS, or `url` for a pre-hosted audio file played via
+`<Play>`) rather than a `str`, since a phone call has no text channel.
+There's deliberately no field for raw audio bytes - Twilio's REST API
+can only play from a URL it can fetch, not from bytes in a request
+body, and this module isn't in the business of hosting files; upload
+your own audio and pass the URL. TwiML generation (`_build_twiml`) is
+kept as a pure function with no I/O specifically so it's cheap to unit
+test exhaustively (escaping, voice selection, text-vs-url branching)
+without touching the network.
+
+---
+
 ## Composing listeners
 
 A common pattern is to listen to multiple platforms concurrently and yield messages as soon as they arrive from *any* source.
@@ -336,5 +539,3 @@ This repo expects a helper for that pattern (either provided here or in your app
 * Style: keep message payloads JSON-friendly
 * Datetimes: always normalize to UTC-aware values
 * Filters: normalize addresses for case-insensitive comparisons
-
-

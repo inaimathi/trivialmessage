@@ -1,14 +1,24 @@
 # src/trivialmessage/slack.py
 # WIP - this is a work in progress module,
 # needs more testing work before we rely on it in prod
-# FIXME - the `listen` method doesn't work as written, and the
-# entire approach to this particular module might need
-# rethinking. Possibly we want a different approach for Slack specifically
+#
+# NOTE (previously FIXME): `listen` used to import `AsyncSocketModeClient`
+# from `slack_sdk.socket_mode.async_client`, which only exposes the abstract
+# `AsyncBaseSocketModeClient` - the concrete implementation lives in
+# `slack_sdk.socket_mode.aiohttp` and requires the `aiohttp` extra. On top of
+# that, the message handler was written as an async *generator* (it used
+# `yield`), but slack_sdk's socket mode listeners only ever `await` the
+# handler - they never iterate it - so no message was ever making it back to
+# the caller, and events were never being acknowledged (which makes Slack
+# redeliver them). Both are fixed below using an asyncio.Queue bridge.
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Dict, List, Optional
 
-from slack_sdk.socket_mode.async_client import AsyncSocketModeClient
+from slack_sdk.socket_mode.aiohttp import \
+    SocketModeClient as AsyncSocketModeClient
+from slack_sdk.socket_mode.request import SocketModeRequest
+from slack_sdk.socket_mode.response import SocketModeResponse
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_sdk.web.client import WebClient
 
@@ -126,21 +136,31 @@ class SlackPlatform(MessagePlatform):
             app_token=self._app_token, web_client=self.async_client
         )
 
-        async def message_handler(client, req):
+        # Bridge slack_sdk's callback-based listener API to an async
+        # generator: the handler pushes onto a queue, and we drain the
+        # queue below. This is what actually makes messages reach the
+        # caller (see module docstring for why the old approach didn't).
+        queue: "asyncio.Queue[Message]" = asyncio.Queue()
+
+        async def message_handler(client, req: SocketModeRequest) -> None:
+            # Ack immediately, or Slack will retry-deliver the event.
+            await client.send_socket_mode_response(
+                SocketModeResponse(envelope_id=req.envelope_id)
+            )
             if req.type == "events_api":
                 event = req.payload.get("event", {})
                 if event.get("type") == "message":
                     message = self._convert_slack_message(event)
                     if message.matches_filter(filters):
-                        yield message
+                        await queue.put(message)
 
         socket_client.socket_mode_request_listeners.append(message_handler)
         await socket_client.connect()
 
         try:
-            # Keep connection alive
             while True:
-                await asyncio.sleep(1)
+                message = await queue.get()
+                yield message
         finally:
             await socket_client.disconnect()
 
@@ -190,3 +210,47 @@ class SlackPlatform(MessagePlatform):
             thread_ts = original_message.thread_id or original_message.id
 
         return self.send(content=reply_content, channel=channel, thread_ts=thread_ts)
+
+    async def send_async(self, content: str, **kwargs) -> Message:
+        """Send a Slack message using the async web client"""
+        channel = kwargs.get("channel") or kwargs.get("to")
+        thread_ts = kwargs.get("thread_ts")
+
+        response = await self.async_client.chat_postMessage(
+            channel=channel, text=content, thread_ts=thread_ts
+        )
+
+        return Message(
+            id=response["ts"],
+            platform_type="slack",
+            content=content,
+            sender="me",
+            timestamp=datetime.fromtimestamp(float(response["ts"])),
+            recipient=channel,
+            thread_id=thread_ts,
+            raw_data=response,
+            platform_metadata={"channel": response["channel"], "sent": True},
+        )
+
+    async def reply_async(
+        self, original_message: Message, content: str, **kwargs
+    ) -> Message:
+        """Reply to a Slack message using the async web client"""
+        channel = original_message.recipient
+        if not channel:
+            raise ValueError("Cannot determine channel from original message")
+
+        thread_reply = kwargs.get("thread_reply", True)
+        mention_sender = kwargs.get("mention_sender", True)
+
+        reply_content = content
+        if mention_sender and original_message.sender:
+            reply_content = f"<@{original_message.sender}> {content}"
+
+        thread_ts = None
+        if thread_reply:
+            thread_ts = original_message.thread_id or original_message.id
+
+        return await self.send_async(
+            content=reply_content, channel=channel, thread_ts=thread_ts
+        )

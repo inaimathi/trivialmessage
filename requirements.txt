@@ -2,6 +2,7 @@ httpx[http2]~=0.27
 json5
 imapclient
 pexpect
+aiohttp
 
 # Gmail API dependencies
 google-api-python-client>=2.0.0

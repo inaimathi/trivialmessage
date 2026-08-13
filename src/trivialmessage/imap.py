@@ -191,8 +191,20 @@ class IMAPPlatform(MessagePlatform):
         return [x.decode("utf-8") for x in data[0].split() if x]
 
     def _uid_fetch_rfc822(self, imap: imaplib.IMAP4, uid: str) -> Optional[bytes]:
-        """Fetch RFC822 bytes for a UID."""
-        typ, data = imap.uid("fetch", uid, "(RFC822)")
+        """
+        Fetch RFC822 bytes for a UID.
+
+        Uses BODY.PEEK[] rather than RFC822: on essentially every real IMAP
+        server, fetching the full RFC822 body implicitly sets the \\Seen
+        flag, which would silently turn `get_unread()` into a
+        mark-as-read-on-read operation - directly contradicting this
+        module's own stated goal (see class docstring / README) of not
+        accidentally marking mail seen. BODY.PEEK[] fetches the same bytes
+        without that side effect; callers that *do* want to mark messages
+        read continue to do so explicitly via UID STORE (see `listen`'s
+        `mark_read` handling).
+        """
+        typ, data = imap.uid("fetch", uid, "(BODY.PEEK[])")
         if typ != "OK" or not data:
             return None
         for item in data:
