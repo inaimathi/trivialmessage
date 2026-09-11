@@ -1,7 +1,11 @@
 # src/trivialmessage/fastmail.py
 import asyncio
+import mimetypes
 from datetime import datetime, timezone
+from os import PathLike
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
+from urllib.parse import quote
 
 import httpx
 
@@ -163,6 +167,273 @@ class FastmailPlatform(MessagePlatform):
                 f"Fastmail JMAP request failed: {resp.status_code} - {resp.text}"
             )
         return resp.json()
+
+    # -------------------------------------------------------------------------
+    # Attachment helpers
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_attachment_filename(value: object) -> str:
+        """
+        Normalize an attachment filename to a basename suitable for Content-Disposition.
+
+        Explicit dictionary filenames may be supplied independently of the local path,
+        so strip both POSIX and Windows-style path components without otherwise
+        modifying the filename.
+        """
+        filename = str(value or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+        if not filename:
+            raise ValueError("attachment filename is required")
+        return filename
+
+    @classmethod
+    def _normalize_attachment(cls, attachment: object) -> dict:
+        """
+        Normalize one outbound attachment to:
+
+            {
+                "filename": str,
+                "content_type": str,
+                "data": bytes,
+            }
+
+        Accepted forms:
+
+        - "path/to/file.pdf" (or any os.PathLike)
+        - {
+              "filename": "optional-name.pdf",
+              "content_type": "optional/type",
+              "data": b"...",
+          }
+        - the same dict with "data" set to a local path instead of bytes
+
+        For path inputs, filename defaults to the local basename and content type is
+        inferred with mimetypes. For direct byte data, filename is required so that
+        the MIME type can be inferred and the recipient sees a useful attachment name.
+        """
+        if isinstance(attachment, (str, PathLike)):
+            path = Path(attachment).expanduser()
+            filename = cls._clean_attachment_filename(path.name)
+            content_type = (
+                mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            )
+            return {
+                "filename": filename,
+                "content_type": content_type,
+                "data": path.read_bytes(),
+            }
+
+        if not isinstance(attachment, dict):
+            raise TypeError(
+                "each attachment must be a local path or a dict with "
+                "'filename', 'content_type', and 'data'"
+            )
+
+        raw_data = attachment.get("data")
+        filename = attachment.get("filename")
+        content_type = attachment.get("content_type")
+
+        if isinstance(raw_data, (str, PathLike)):
+            path = Path(raw_data).expanduser()
+            data = path.read_bytes()
+            if not filename:
+                filename = path.name
+        elif isinstance(raw_data, bytes):
+            data = raw_data
+        elif isinstance(raw_data, bytearray):
+            data = bytes(raw_data)
+        elif isinstance(raw_data, memoryview):
+            data = raw_data.tobytes()
+        else:
+            raise TypeError(
+                "attachment dict 'data' must be bytes, bytearray, memoryview, "
+                "or a local path"
+            )
+
+        filename = cls._clean_attachment_filename(filename)
+
+        if content_type is None or not str(content_type).strip():
+            content_type = (
+                mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            )
+        else:
+            content_type = str(content_type).strip()
+
+        return {
+            "filename": filename,
+            "content_type": content_type,
+            "data": data,
+        }
+
+    @classmethod
+    def _normalize_attachments(cls, attachments: object) -> List[dict]:
+        """
+        Normalize the public `attachments=` argument.
+
+        `attachments` may be:
+          - one local path
+          - one attachment dict
+          - any iterable of local paths and/or attachment dicts
+
+        A top-level bytes value is intentionally rejected because it has no filename.
+        Use {"filename": "...", "data": bytes_value} for in-memory data.
+        """
+        if attachments is None:
+            return []
+
+        if isinstance(attachments, (str, PathLike, dict)):
+            values = [attachments]
+        elif isinstance(attachments, (bytes, bytearray, memoryview)):
+            raise TypeError(
+                "a raw bytes attachment needs a filename; pass "
+                "{'filename': '...', 'data': bytes_value}"
+            )
+        else:
+            try:
+                values = list(attachments)
+            except TypeError as exc:
+                raise TypeError(
+                    "attachments must be a local path, an attachment dict, "
+                    "or an iterable of those values"
+                ) from exc
+
+        return [cls._normalize_attachment(value) for value in values]
+
+    def _attachment_upload_url(self) -> str:
+        """Resolve the JMAP session uploadUrl template for this account."""
+        if not self.upload_url:
+            self._load_session()
+
+        if not self.upload_url or not self.account_id:
+            raise OSError(
+                "Fastmail JMAP session did not provide an upload URL/account ID"
+            )
+
+        return self.upload_url.replace(
+            "{accountId}",
+            quote(str(self.account_id), safe=""),
+        )
+
+    def _upload_attachments(self, attachments: List[dict]) -> List[dict]:
+        """Upload normalized attachments and add each returned JMAP blob id."""
+        if not attachments:
+            return []
+
+        upload_url = self._attachment_upload_url()
+        uploaded: List[dict] = []
+
+        with httpx.Client(timeout=30.0) as client:
+            for attachment in attachments:
+                resp = client.post(
+                    upload_url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_token}",
+                        "Content-Type": attachment["content_type"],
+                    },
+                    content=attachment["data"],
+                )
+
+                if not resp.is_success:
+                    raise OSError(
+                        f"Fastmail attachment upload failed for "
+                        f"{attachment['filename']!r}: "
+                        f"{resp.status_code} - {resp.text}"
+                    )
+
+                result = resp.json()
+                blob_id = result.get("blobId")
+                if not blob_id:
+                    raise OSError(
+                        f"Fastmail attachment upload returned no blobId for "
+                        f"{attachment['filename']!r}: {result}"
+                    )
+
+                uploaded.append(
+                    {
+                        **attachment,
+                        "blob_id": blob_id,
+                        "size": result.get("size", len(attachment["data"])),
+                    }
+                )
+
+        return uploaded
+
+    async def _upload_attachments_async(self, attachments: List[dict]) -> List[dict]:
+        """Async equivalent of _upload_attachments()."""
+        if not attachments:
+            return []
+
+        # Resolving uploadUrl can refresh the JMAP session synchronously.
+        upload_url = await asyncio.to_thread(self._attachment_upload_url)
+        uploaded: List[dict] = []
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            for attachment in attachments:
+                resp = await client.post(
+                    upload_url,
+                    headers={
+                        "Authorization": f"Bearer {self.api_token}",
+                        "Content-Type": attachment["content_type"],
+                    },
+                    content=attachment["data"],
+                )
+
+                if not resp.is_success:
+                    raise OSError(
+                        f"Fastmail attachment upload failed for "
+                        f"{attachment['filename']!r}: "
+                        f"{resp.status_code} - {resp.text}"
+                    )
+
+                result = resp.json()
+                blob_id = result.get("blobId")
+                if not blob_id:
+                    raise OSError(
+                        f"Fastmail attachment upload returned no blobId for "
+                        f"{attachment['filename']!r}: {result}"
+                    )
+
+                uploaded.append(
+                    {
+                        **attachment,
+                        "blob_id": blob_id,
+                        "size": result.get("size", len(attachment["data"])),
+                    }
+                )
+
+        return uploaded
+
+    @staticmethod
+    def _attachment_body_parts(attachments: List[dict]) -> List[dict]:
+        """Convert uploaded attachments to JMAP EmailBodyPart dictionaries."""
+        return [
+            {
+                "blobId": attachment["blob_id"],
+                "type": attachment["content_type"],
+                "name": attachment["filename"],
+                "disposition": "attachment",
+            }
+            for attachment in attachments
+        ]
+
+    @staticmethod
+    def _attachment_message_metadata(attachments: List[dict]) -> List[dict]:
+        """
+        Return attachment metadata suitable for Message.attachments.
+
+        Do not copy raw bytes into the returned Message; callers already have those
+        bytes if they supplied them, and retaining them here would make Message
+        serialization unexpectedly large.
+        """
+        return [
+            {
+                "filename": attachment["filename"],
+                "content_type": attachment["content_type"],
+                "size": attachment.get("size", len(attachment["data"])),
+                "blob_id": attachment["blob_id"],
+            }
+            for attachment in attachments
+        ]
 
     # -------------------------------------------------------------------------
     # Filters / parsing
@@ -743,7 +1014,20 @@ class FastmailPlatform(MessagePlatform):
     # -------------------------------------------------------------------------
 
     def send(self, content: str, **kwargs) -> Message:
-        """Send email via Fastmail JMAP (Email/set draft + EmailSubmission/set)."""
+        """
+        Send email via Fastmail JMAP (Email/set draft + EmailSubmission/set).
+
+        `attachments` may be one local path, an iterable of local paths, one
+        attachment dict, or an iterable of attachment dicts. Dicts use:
+
+            {
+                "filename": "something.pdf",
+                "content_type": "application/pdf",
+                "data": b"...",  # or a local path
+            }
+
+        Filename/content type are inferred where possible.
+        """
         to = kwargs.get("to")
         if not to:
             raise ValueError("'to' recipient is required")
@@ -753,6 +1037,7 @@ class FastmailPlatform(MessagePlatform):
         cc = kwargs.get("cc")
         bcc = kwargs.get("bcc")
         from_email = kwargs.get("from_email")
+        attachments = self._normalize_attachments(kwargs.get("attachments"))
 
         # Optional threading headers (JMAP Email.inReplyTo / Email.references)
         in_reply_to = self._as_message_id_list(kwargs.get("in_reply_to"))
@@ -761,6 +1046,8 @@ class FastmailPlatform(MessagePlatform):
         drafts_mailbox_id = self._mailbox_id_for_role("drafts", required=True)
         sent_mailbox_id = self._mailbox_id_for_role("sent", required=False)
         identity_id = self._identity_id(from_email)
+
+        uploaded_attachments = self._upload_attachments(attachments)
 
         # Build Email object using bodyValues (JMAP-compatible).
         email_obj: dict = {
@@ -788,6 +1075,9 @@ class FastmailPlatform(MessagePlatform):
         if html:
             email_obj["htmlBody"] = [{"partId": "h1", "type": "text/html"}]
             email_obj["bodyValues"]["h1"] = {"charset": "utf-8", "value": html}
+
+        if uploaded_attachments:
+            email_obj["attachments"] = self._attachment_body_parts(uploaded_attachments)
 
         # Two method calls in ONE request, using backreferences.
         email_set_call = [
@@ -859,6 +1149,11 @@ class FastmailPlatform(MessagePlatform):
             recipient=to,
             subject=subject,
             html_content=html,
+            attachments=(
+                self._attachment_message_metadata(uploaded_attachments)
+                if uploaded_attachments
+                else None
+            ),
             raw_data=res,
             platform_metadata={"cc": cc, "bcc": bcc, "sent": True},
         )
@@ -866,7 +1161,9 @@ class FastmailPlatform(MessagePlatform):
     async def send_async(self, content: str, **kwargs) -> Message:
         """
         Async version of send().
-        This avoids blocking the event loop (useful when replying inside listen()).
+
+        File reads are normalized in a worker thread, while blob uploads and the
+        JMAP send request use httpx's async client so the event loop is not blocked.
         """
         to = kwargs.get("to")
         if not to:
@@ -877,6 +1174,11 @@ class FastmailPlatform(MessagePlatform):
         cc = kwargs.get("cc")
         bcc = kwargs.get("bcc")
         from_email = kwargs.get("from_email")
+
+        attachments = await asyncio.to_thread(
+            self._normalize_attachments,
+            kwargs.get("attachments"),
+        )
 
         in_reply_to = self._as_message_id_list(kwargs.get("in_reply_to"))
         references = self._as_message_id_list(kwargs.get("references"))
@@ -889,6 +1191,8 @@ class FastmailPlatform(MessagePlatform):
             lambda: self._mailbox_id_for_role("sent", required=False)
         )
         identity_id = await asyncio.to_thread(self._identity_id, from_email)
+
+        uploaded_attachments = await self._upload_attachments_async(attachments)
 
         email_obj: dict = {
             "to": [{"email": to}],
@@ -914,6 +1218,9 @@ class FastmailPlatform(MessagePlatform):
         if html:
             email_obj["htmlBody"] = [{"partId": "h1", "type": "text/html"}]
             email_obj["bodyValues"]["h1"] = {"charset": "utf-8", "value": html}
+
+        if uploaded_attachments:
+            email_obj["attachments"] = self._attachment_body_parts(uploaded_attachments)
 
         email_set_call = [
             "Email/set",
@@ -973,6 +1280,11 @@ class FastmailPlatform(MessagePlatform):
             recipient=to,
             subject=subject,
             html_content=html,
+            attachments=(
+                self._attachment_message_metadata(uploaded_attachments)
+                if uploaded_attachments
+                else None
+            ),
             raw_data=res,
             platform_metadata={"cc": cc, "bcc": bcc, "sent": True},
         )
@@ -1017,6 +1329,7 @@ class FastmailPlatform(MessagePlatform):
             from_email=from_email,
             in_reply_to=in_reply_to,
             references=references,
+            attachments=kwargs.get("attachments"),
         )
 
     async def reply_async(
@@ -1061,4 +1374,5 @@ class FastmailPlatform(MessagePlatform):
             from_email=from_email,
             in_reply_to=in_reply_to,
             references=references,
+            attachments=kwargs.get("attachments"),
         )
