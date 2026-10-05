@@ -1,10 +1,13 @@
 # src/trivialmessage/common.py
 import json
+import mimetypes
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from email.utils import parseaddr
+from os import PathLike
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 
@@ -359,3 +362,126 @@ class FixedSizeSet:
 
     def __len__(self):
         return len(self.set_data)
+
+
+def _clean_attachment_filename(value: object) -> str:
+    """
+    Normalize an attachment filename to a basename suitable for transport APIs.
+
+    Explicit dictionary filenames may be supplied independently of the local path,
+    so strip both POSIX and Windows-style path components without otherwise
+    modifying the filename.
+    """
+    filename = str(value or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    if not filename:
+        raise ValueError("attachment filename is required")
+    return filename
+
+
+def normalize_attachment(attachment: object) -> dict:
+    """
+    Normalize one outbound attachment to:
+
+        {
+            "filename": str,
+            "content_type": str,
+            "data": bytes,
+        }
+
+    Accepted forms:
+
+    - "path/to/file.pdf" (or any os.PathLike)
+    - {
+          "filename": "optional-name.pdf",
+          "content_type": "optional/type",
+          "data": b"...",
+      }
+    - the same dict with "data" set to a local path instead of bytes
+
+    For path inputs, filename defaults to the local basename and content type is
+    inferred with mimetypes. For direct byte data, filename is required so that
+    the MIME type can be inferred and the recipient sees a useful attachment name.
+    """
+    if isinstance(attachment, (str, PathLike)):
+        path = Path(attachment).expanduser()
+        filename = _clean_attachment_filename(path.name)
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return {
+            "filename": filename,
+            "content_type": content_type,
+            "data": path.read_bytes(),
+        }
+
+    if not isinstance(attachment, dict):
+        raise TypeError(
+            "each attachment must be a local path or a dict with "
+            "'filename', 'content_type', and 'data'"
+        )
+
+    raw_data = attachment.get("data")
+    filename = attachment.get("filename")
+    content_type = attachment.get("content_type")
+
+    if isinstance(raw_data, (str, PathLike)):
+        path = Path(raw_data).expanduser()
+        data = path.read_bytes()
+        if not filename:
+            filename = path.name
+    elif isinstance(raw_data, bytes):
+        data = raw_data
+    elif isinstance(raw_data, bytearray):
+        data = bytes(raw_data)
+    elif isinstance(raw_data, memoryview):
+        data = raw_data.tobytes()
+    else:
+        raise TypeError(
+            "attachment dict 'data' must be bytes, bytearray, memoryview, "
+            "or a local path"
+        )
+
+    filename = _clean_attachment_filename(filename)
+
+    if content_type is None or not str(content_type).strip():
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    else:
+        content_type = str(content_type).strip()
+
+    return {
+        "filename": filename,
+        "content_type": content_type,
+        "data": data,
+    }
+
+
+def normalize_attachments(attachments: object) -> List[dict]:
+    """
+    Normalize the public `attachments=` argument.
+
+    `attachments` may be:
+      - one local path
+      - one attachment dict
+      - any iterable of local paths and/or attachment dicts
+
+    A top-level bytes value is intentionally rejected because it has no filename.
+    Use {"filename": "...", "data": bytes_value} for in-memory data.
+    """
+    if attachments is None:
+        return []
+
+    if isinstance(attachments, (str, PathLike, dict)):
+        values = [attachments]
+    elif isinstance(attachments, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            "a raw bytes attachment needs a filename; pass "
+            "{'filename': '...', 'data': bytes_value}"
+        )
+    else:
+        try:
+            values = list(attachments)
+        except TypeError as exc:
+            raise TypeError(
+                "attachments must be a local path, an attachment dict, "
+                "or an iterable of those values"
+            ) from exc
+
+    return [normalize_attachment(value) for value in values]

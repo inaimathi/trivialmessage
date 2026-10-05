@@ -1,16 +1,13 @@
 # src/trivialmessage/fastmail.py
 import asyncio
-import mimetypes
 from datetime import datetime, timezone
-from os import PathLike
-from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 from urllib.parse import quote
 
 import httpx
 
 from .common import (Message, MessageFilter, MessagePlatform,
-                     canonicalize_from_recipient)
+                     canonicalize_from_recipient, normalize_attachments)
 
 JMAP_CORE = "urn:ietf:params:jmap:core"
 JMAP_MAIL = "urn:ietf:params:jmap:mail"
@@ -171,133 +168,6 @@ class FastmailPlatform(MessagePlatform):
     # -------------------------------------------------------------------------
     # Attachment helpers
     # -------------------------------------------------------------------------
-
-    @staticmethod
-    def _clean_attachment_filename(value: object) -> str:
-        """
-        Normalize an attachment filename to a basename suitable for Content-Disposition.
-
-        Explicit dictionary filenames may be supplied independently of the local path,
-        so strip both POSIX and Windows-style path components without otherwise
-        modifying the filename.
-        """
-        filename = str(value or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
-        if not filename:
-            raise ValueError("attachment filename is required")
-        return filename
-
-    @classmethod
-    def _normalize_attachment(cls, attachment: object) -> dict:
-        """
-        Normalize one outbound attachment to:
-
-            {
-                "filename": str,
-                "content_type": str,
-                "data": bytes,
-            }
-
-        Accepted forms:
-
-        - "path/to/file.pdf" (or any os.PathLike)
-        - {
-              "filename": "optional-name.pdf",
-              "content_type": "optional/type",
-              "data": b"...",
-          }
-        - the same dict with "data" set to a local path instead of bytes
-
-        For path inputs, filename defaults to the local basename and content type is
-        inferred with mimetypes. For direct byte data, filename is required so that
-        the MIME type can be inferred and the recipient sees a useful attachment name.
-        """
-        if isinstance(attachment, (str, PathLike)):
-            path = Path(attachment).expanduser()
-            filename = cls._clean_attachment_filename(path.name)
-            content_type = (
-                mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            )
-            return {
-                "filename": filename,
-                "content_type": content_type,
-                "data": path.read_bytes(),
-            }
-
-        if not isinstance(attachment, dict):
-            raise TypeError(
-                "each attachment must be a local path or a dict with "
-                "'filename', 'content_type', and 'data'"
-            )
-
-        raw_data = attachment.get("data")
-        filename = attachment.get("filename")
-        content_type = attachment.get("content_type")
-
-        if isinstance(raw_data, (str, PathLike)):
-            path = Path(raw_data).expanduser()
-            data = path.read_bytes()
-            if not filename:
-                filename = path.name
-        elif isinstance(raw_data, bytes):
-            data = raw_data
-        elif isinstance(raw_data, bytearray):
-            data = bytes(raw_data)
-        elif isinstance(raw_data, memoryview):
-            data = raw_data.tobytes()
-        else:
-            raise TypeError(
-                "attachment dict 'data' must be bytes, bytearray, memoryview, "
-                "or a local path"
-            )
-
-        filename = cls._clean_attachment_filename(filename)
-
-        if content_type is None or not str(content_type).strip():
-            content_type = (
-                mimetypes.guess_type(filename)[0] or "application/octet-stream"
-            )
-        else:
-            content_type = str(content_type).strip()
-
-        return {
-            "filename": filename,
-            "content_type": content_type,
-            "data": data,
-        }
-
-    @classmethod
-    def _normalize_attachments(cls, attachments: object) -> List[dict]:
-        """
-        Normalize the public `attachments=` argument.
-
-        `attachments` may be:
-          - one local path
-          - one attachment dict
-          - any iterable of local paths and/or attachment dicts
-
-        A top-level bytes value is intentionally rejected because it has no filename.
-        Use {"filename": "...", "data": bytes_value} for in-memory data.
-        """
-        if attachments is None:
-            return []
-
-        if isinstance(attachments, (str, PathLike, dict)):
-            values = [attachments]
-        elif isinstance(attachments, (bytes, bytearray, memoryview)):
-            raise TypeError(
-                "a raw bytes attachment needs a filename; pass "
-                "{'filename': '...', 'data': bytes_value}"
-            )
-        else:
-            try:
-                values = list(attachments)
-            except TypeError as exc:
-                raise TypeError(
-                    "attachments must be a local path, an attachment dict, "
-                    "or an iterable of those values"
-                ) from exc
-
-        return [cls._normalize_attachment(value) for value in values]
 
     def _attachment_upload_url(self) -> str:
         """Resolve the JMAP session uploadUrl template for this account."""
@@ -1037,7 +907,7 @@ class FastmailPlatform(MessagePlatform):
         cc = kwargs.get("cc")
         bcc = kwargs.get("bcc")
         from_email = kwargs.get("from_email")
-        attachments = self._normalize_attachments(kwargs.get("attachments"))
+        attachments = normalize_attachments(kwargs.get("attachments"))
 
         # Optional threading headers (JMAP Email.inReplyTo / Email.references)
         in_reply_to = self._as_message_id_list(kwargs.get("in_reply_to"))
@@ -1176,7 +1046,7 @@ class FastmailPlatform(MessagePlatform):
         from_email = kwargs.get("from_email")
 
         attachments = await asyncio.to_thread(
-            self._normalize_attachments,
+            normalize_attachments,
             kwargs.get("attachments"),
         )
 
